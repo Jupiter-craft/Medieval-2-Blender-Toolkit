@@ -5,8 +5,8 @@ import subprocess
 import sys
 import bpy
 from pathlib import Path
-from .export_checks import (deselectAll, materialImages, activeExportArmature, exportSettings,
-                            imageBaseName, textureBaseName)
+from .export_checks import (deselectAll, materialImages, materialImageNodes, activeExportArmature,
+                            exportSettings, imageBaseName, textureBaseName)
 from ..directories import loadStoredValue
 from ..m2formats.mesh import MeshError
 from .bmdb_writer import buildEntry, parseRelativeUnitPath, bmdbEntryNames
@@ -71,18 +71,66 @@ def defaultTaskTemplate(reader):
         return stored
     return reader.directory_iwte_task_template
 
-def collect_textures(objects):
-    textures = set()
+def collect_images(objects):
+    """Every image the meshes' materials render with, in material order. Spare
+    image nodes not wired into the material are left out (materialImageNodes)."""
+    images = []
     for obj in objects:
         if obj.type != 'MESH':
             continue
         for mat in obj.data.materials:
-            if not mat or not mat.use_nodes:
-                continue
-            for node in mat.node_tree.nodes:
-                if node.type == 'TEX_IMAGE' and node.image and node.image.filepath:
-                    textures.add(bpy.path.abspath(node.image.filepath))
-    return textures
+            for node in materialImageNodes(mat):
+                if node.image not in images:
+                    images.append(node.image)
+    return images
+
+def imageKey(image):
+    """What makes two images the same texture: the file on disk, so two
+    datablocks of one file (image, image.001) convert once - or the datablock
+    itself for a packed image, whose filepath may be blank or shared."""
+    if image.packed_file is not None or not image.filepath:
+        return image
+    return bpy.path.abspath(image.filepath)
+
+# leading bytes of the formats a packed image can hold; TGA has no signature,
+# so it is told apart by its file name or Blender's file format instead
+PACKED_SIGNATURES = ((b'DDS ', '.dds'), (b'\x89PNG', '.png'), (b'\xff\xd8\xff', '.jpg'))
+
+def packedExtension(image, data):
+    """The extension a packed image's bytes should be written out under, or
+    None when it is not a format the export converts."""
+    for signature, ext in PACKED_SIGNATURES:
+        if data.startswith(signature):
+            return ext
+    ext = os.path.splitext(image.filepath)[1].lower()
+    if ext in ('.tga',) or image.file_format == 'TARGA':
+        return '.tga'
+    return None
+
+def imageSourceFile(image, tex_dir, out_base):
+    """A file on disk holding `image`, for textureFromFile. A packed image -
+    a texture packed into the .blend, or one a glTF/FBX import carried in with
+    no file of its own - has its bytes written out into tex_dir under its
+    output name first. Returns (path, error); (None, None) means there is no
+    file to convert, which is skipped quietly as it always was."""
+    if image.packed_file is not None:
+        data = bytes(image.packed_file.data)
+        ext = packedExtension(image, data)
+        if ext is None:
+            return None, "packed in a format the export can not convert"
+        path = os.path.join(tex_dir, out_base + ext)
+        try:
+            with open(path, "wb") as packed_out:
+                packed_out.write(data)
+        except OSError as error:
+            return None, "could not unpack it: %s" % error
+        return path, None
+    path = bpy.path.abspath(image.filepath) if image.filepath else ""
+    if not path or not os.path.exists(path):
+        return None, None
+    if os.path.splitext(path)[1].lower() not in SUPPORTED_TEXTURE_EXTS:
+        return None, None
+    return path, None
 
 DXT_FOURCCS = ('DXT1', 'DXT3', 'DXT5')
 
@@ -502,7 +550,7 @@ def exportArmatureGLB(context):
     rename_map = {}
     for image, name in (plan[slot] for slot in IMAGE_SLOTS):
         if image is not None and name:
-            rename_map[bpy.path.abspath(image.filepath)] = name
+            rename_map[imageKey(image)] = name
 
     visibility_backup = [(obj, obj.hide_get()) for obj in export_objects]
     # Stacked or dead Armature modifiers (duplicates, object=None, or aimed at
@@ -577,13 +625,20 @@ def exportArmatureGLB(context):
         if warning:
             texture_warnings.append(warning)
 
-    for tex in collect_textures(meshes):
-        if not os.path.exists(tex):
+    converted = set()
+    for image in collect_images(meshes):
+        key = imageKey(image)
+        if key in converted:
             continue
-        if os.path.splitext(tex)[1].lower() not in SUPPORTED_TEXTURE_EXTS:
+        converted.add(key)
+        out_base = rename_map.get(key) or imageBaseName(image)
+        source, error = imageSourceFile(image, tex_dir, out_base)
+        if error:
+            texture_errors.append("%s (%s)" % (image.name, error))
+        if source is None:
             continue
-        out_base = rename_map.get(bpy.path.abspath(tex)) or os.path.splitext(os.path.basename(tex))[0]
-        convert(tex, out_base, os.path.basename(tex), diffuse=out_base in diffuse_names)
+        convert(source, out_base, os.path.basename(image.filepath) or image.name,
+                diffuse=out_base in diffuse_names)
 
     # normal maps pointed at a file on disk instead of being wired into the
     # material go through the same conversion, so a normal map painted in an

@@ -228,6 +228,13 @@ class MED_2_TOOLKIT_Unit_Export_Data(bpy.types.PropertyGroup):
     # All default on except the two that were already opt-in below, so a rig
     # from an older file behaves exactly as it did.
     show_check_options: BoolProperty(name = "Check options", description = "Show the individual passes the check runs, so any of them can be turned off", default = False)
+    check_transforms: EnumProperty(
+        name = "Transforms",
+        description = "What the check does with location, rotation and scale left on the meshes. The armature itself is never changed, only reported",
+        items = [('NONE', "Leave", "Do not touch the mesh transforms"),
+                 ('APPLY', "Apply", "Bake each mesh's location, rotation and scale into its vertices (Ctrl+A > All Transforms) - nothing moves, the transform reads zero afterwards"),
+                 ('RESET', "Reset", "Clear each mesh's location, rotation and scale (Alt+G/R/S) - a mesh that was moved, turned or scaled snaps back onto the rig")],
+        default = 'NONE')
     check_fix_names: BoolProperty(name = "Fix mesh names", description = "Rename the meshes to the x__y export format: strip Blender's trailing .001 numbers, double the first underscore, and turn a name ending in a number into name__name_number. The __opt marker is kept. Off leaves every name exactly as it is - including names the game will not read", default = True)
     check_weapon_meshes: BoolProperty(name = "Check weapon meshes", description = "Report a missing primaryactive0__ or secondaryactive0__ object. A warning on a ranged skeleton, which needs both, and a note on a melee one", default = True)
     check_material_slots: BoolProperty(name = "Remove duplicate material slots", description = "Collapse slots on the same object that hold the same material, keeping the faces on the surviving slot. Off means the material count check below sees those extra slots and can call a two-material object a three-material one", default = True)
@@ -1139,6 +1146,10 @@ class MED_2_TOOLKIT_PT_Unit_Export(bpy.types.Panel):
         col.prop(export_data, "export_glb_name")
 
         layout.operator("medieval2toolkit.select_cleanup", icon='CHECKMARK')
+        # outside the fold: it moves or reshapes meshes, so it stays in sight
+        row = layout.row(align=True)
+        row.label(text="Transforms")
+        row.prop(export_data, "check_transforms", expand=True)
 
         # what the check does, one tick each, folded away by default so the
         # button stays the whole of it for anyone not tuning the passes

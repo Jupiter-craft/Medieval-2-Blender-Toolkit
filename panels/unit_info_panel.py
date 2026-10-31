@@ -843,6 +843,53 @@ class MED_2_TOOLKIT_OT_Render_Cards(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def previewCamera(context):
+    """The card camera the scene is looking through, or None."""
+    camera = context.scene.camera
+    if camera is not None and camera.type == 'CAMERA' and CAMERA_TAG in camera:
+        return camera
+    return None
+
+
+class MED_2_TOOLKIT_OT_Preview_Card(bpy.types.Operator):
+    bl_idname = "medieval2toolkit.preview_card"
+    bl_label = "Preview Card"
+    bl_description = ("Render the active card camera exactly as Render Cards would - same isolation, compositor "
+                      "and .tga.dds conversion - into a temporary folder and show the result. Nothing is "
+                      "written into the card output folder")
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return _card_job is None and previewCamera(context) is not None
+
+    def execute(self, context):
+        scene = context.scene
+        camera = previewCamera(context)
+        unit_id = camera.get(CAMERA_TAG, "") or camera.name
+        results = []
+        width, height, supersample = applyRenderSettings(context, results)
+        _subfolder, pattern, _dir_key = cardOutputParts(scene.med2_toolkit_cards)
+        # Blender's own session temp folder, so the preview never lands in the
+        # mod and is gone once Blender closes
+        entry = {
+            'id': unit_id,
+            'camera': camera,
+            'target': card_renderer.cameraTarget(scene, camera),
+            'path': os.path.join(bpy.app.tempdir, "med2_card_preview", pattern % unit_id),
+        }
+        reason = renderCard(context, entry, width, height, supersample)
+        if reason is not None:
+            results.append(('ERROR', "%s: %s" % (unit_id, reason)))
+            reportResults(self, context, "Card preview failed", results)
+            return {'CANCELLED'}
+        if entry.get('warning'):
+            results.append(('WARNING', "%s: %s" % (unit_id, entry['warning'])))
+        results.append(openRendersWindow(context, renderedPaths(entry)))
+        reportResults(self, context, "Card preview: %s" % unit_id, results)
+        return {'FINISHED'}
+
+
 class MED_2_TOOLKIT_OT_Open_Card_Folder(bpy.types.Operator):
     bl_idname = "medieval2toolkit.open_card_folder"
     bl_label = "Open Card Folder"
@@ -1105,6 +1152,12 @@ class MED_2_TOOLKIT_PT_Card_Render(bpy.types.Panel):
             layout.label(text="Esc to stop", icon='INFO')
         else:
             layout.operator("medieval2toolkit.render_cards", icon='RENDER_STILL')
+            # only offered while looking through a card camera, and named after
+            # the unit it frames so it is clear which card comes out
+            camera = previewCamera(context)
+            if camera is not None:
+                layout.operator("medieval2toolkit.preview_card", icon='HIDE_OFF',
+                                text="Preview Card (%s)" % camera.get(card_renderer.TARGET_TAG, camera.name))
         layout.prop(settings, "open_renders")
         layout.operator("medieval2toolkit.open_card_folder", icon='FILE_FOLDER')
         if context.mode != 'OBJECT':
@@ -1124,6 +1177,7 @@ classes = [
     MED_2_TOOLKIT_OT_Toggle_Card_Folder,
     MED_2_TOOLKIT_OT_Edit_Card_Folders,
     MED_2_TOOLKIT_OT_Render_Cards,
+    MED_2_TOOLKIT_OT_Preview_Card,
     MED_2_TOOLKIT_OT_Open_Card_Folder,
     ]
 

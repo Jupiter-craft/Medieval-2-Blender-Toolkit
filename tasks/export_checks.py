@@ -2,6 +2,7 @@ import os
 import re
 import math
 import bpy
+from mathutils import Matrix
 from .armature_tools import skeletonUsesLowercase
 from .control_rig import controlRigOf
 
@@ -158,15 +159,45 @@ def formatExportName(base):
         return "%s__%s" % (base, base), 'doubled'
     return base, None
 
+def materialImageNodes(material):
+    """The image texture nodes a material actually renders with: those wired,
+    directly or through other nodes, into its active Material Output. A spare
+    image node left lying in the node tree - an old texture, a bake target -
+    used to be read as the diffuse just as readily as the wired one.
+
+    A material with no wired image at all (an output-less tree, or one built
+    by a script) falls back to every image node, as before."""
+    if not material or not material.use_nodes or not material.node_tree:
+        return []
+    tree = material.node_tree
+    images = [node for node in tree.nodes if node.type == 'TEX_IMAGE' and node.image]
+    output = tree.get_output_node('ALL')
+    if output is None:
+        output = next((node for node in tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
+    if output is None:
+        return images
+    feeding = {}
+    for link in tree.links:
+        if link.is_valid and not link.is_muted:
+            feeding.setdefault(link.to_node, []).append(link.from_node)
+    reached = set()
+    pending = [output]
+    while pending:
+        node = pending.pop()
+        if node in reached:
+            continue
+        reached.add(node)
+        pending.extend(feeding.get(node, ()))
+    connected = [node for node in images if node in reached]
+    return connected or images
+
 def materialImages(material):
     """Return (diffuse_image, normal_image) for a material."""
     diffuse = None
     normal = None
     if not material or not material.use_nodes:
         return None, None
-    for node in material.node_tree.nodes:
-        if node.type != 'TEX_IMAGE' or not node.image:
-            continue
+    for node in materialImageNodes(material):
         feeds_normal = False
         for link in material.node_tree.links:
             if link.from_node == node and (link.to_node.type == 'NORMAL_MAP' or link.to_socket.name == 'Normal'):
@@ -188,10 +219,8 @@ def uniqueMaterials(meshes):
 
 def materialFingerprint(material):
     images = set()
-    if material.use_nodes:
-        for node in material.node_tree.nodes:
-            if node.type == 'TEX_IMAGE' and node.image:
-                images.add(bpy.path.abspath(node.image.filepath) or node.image.name)
+    for node in materialImageNodes(material):
+        images.add(bpy.path.abspath(node.image.filepath) or node.image.name)
     return (baseName(material.name), frozenset(images))
 
 # Blender's own name for a mesh's first UV map. A mesh that carries several
@@ -501,10 +530,8 @@ def checkTextureSizes(meshes):
     report = []
     seen_images = set()
     for material in uniqueMaterials(meshes):
-        if not material.use_nodes:
-            continue
-        for node in material.node_tree.nodes:
-            if node.type != 'TEX_IMAGE' or not node.image or node.image in seen_images:
+        for node in materialImageNodes(material):
+            if node.image in seen_images:
                 continue
             seen_images.add(node.image)
             w, h = node.image.size
@@ -541,6 +568,53 @@ CLEANUP_PASSES = [
     ('check_texture_sizes', lambda armature, meshes: checkTextureSizes(meshes)),
 ]
 
+def fixTransforms(armature, meshes, mode):
+    """Clear the object transforms off the export meshes before anything else
+    looks at them. 'APPLY' bakes each mesh's location/rotation/scale into its
+    vertices so nothing moves (Ctrl+A > All Transforms); 'RESET' zeroes them
+    (Alt+G/R/S), which snaps a mesh back onto its parent. The armature itself is
+    never touched - applying a scale to a rig changes its bones and breaks any
+    action keyed on them - so a transformed armature is only reported.
+    Returns a list of (level, message)."""
+    report = []
+    changed = []
+    shared = []
+    identity = Matrix.Identity(4)
+    for obj in meshes:
+        basis = obj.matrix_basis
+        if all(abs(basis[row][col] - identity[row][col]) < 1e-6 for row in range(4) for col in range(4)):
+            continue
+        if mode == 'APPLY' and obj.data.users > 1:
+            # baking into data another object also uses would move that object too
+            shared.append(obj.name)
+            continue
+        # children of this mesh keep their place in the world either way
+        children = [(child, child.matrix_world.copy()) for child in obj.children]
+        loc, rot, scale = basis.decompose()
+        description = "%s (loc %.3g %.3g %.3g, rot %.3g %.3g %.3g, scale %.3g %.3g %.3g)" % (
+            obj.name, *loc, *(math.degrees(a) for a in rot.to_euler()), *scale)
+        if mode == 'APPLY':
+            obj.data.transform(basis.copy(), shape_keys=True)
+            # a mirrored scale turns the faces inside out once it is in the vertices
+            if basis.determinant() < 0:
+                obj.data.flip_normals()
+            obj.data.update()
+        obj.matrix_basis = identity
+        for child, world in children:
+            child.matrix_world = world
+        changed.append(description)
+    if changed:
+        verb = "Applied" if mode == 'APPLY' else "Reset"
+        report.append(('INFO', "%s transforms on %d object(s): %s" % (verb, len(changed), ", ".join(changed))))
+    if shared:
+        report.append(('WARNING', "Transforms not applied - the mesh data is shared with another object, make it single user first: %s" % ", ".join(shared)))
+    basis = armature.matrix_basis
+    if any(abs(basis[row][col] - identity[row][col]) > 1e-6 for row in range(4) for col in range(4)):
+        report.append(('WARNING', "Armature %s has its own location/rotation/scale - left alone, fix it by hand if the unit comes out offset or scaled in game" % armature.name))
+    if not report:
+        report.append(('INFO', "Transforms already clear on every object"))
+    return report
+
 def runSelectCleanup(context):
     """Select the armature's export set and run the passes that are ticked.
     Returns a list of (level, message) where level is INFO/WARNING/ERROR."""
@@ -565,6 +639,9 @@ def runSelectCleanup(context):
     context.view_layer.objects.active = armature
 
     settings = armature.med2_toolkit_unit_export
+    # first, so every later pass measures the meshes as they will export
+    if settings.check_transforms != 'NONE':
+        report.extend(fixTransforms(armature, meshes, settings.check_transforms))
     for prop, run in CLEANUP_PASSES:
         if getattr(settings, prop):
             report.extend(run(armature, meshes))
@@ -774,6 +851,23 @@ def autoAssignUV(context):
     if main_mat is None and attach_mat is None:
         return [('WARNING', "Textures not set, so UV space could not be auto-assigned. Set the main/attach texture and rerun.")]
 
+    # UVs are written straight to the mesh data, which edit mode overwrites from
+    # its own copy on exit, so drop to object mode first (this also flushes any
+    # edit-mode changes) and go back afterwards
+    was_edit = context.mode == 'EDIT_MESH'
+    if was_edit:
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+    # reveal geometry hidden in edit mode so the whole island moves together
+    unhidden = []
+    for obj in meshes:
+        mesh = obj.data
+        if any(p.hide for p in mesh.polygons) or any(v.hide for v in mesh.vertices):
+            for elems in (mesh.vertices, mesh.edges, mesh.polygons):
+                elems.foreach_set("hide", [False] * len(elems))
+            mesh.update()
+            unhidden.append(obj.name)
+
     eps = 0.001
     moved = []
     skipped = []
@@ -805,7 +899,12 @@ def autoAssignUV(context):
             loop_uv.uv[1] += shift_v
         moved.append(obj.name)
 
+    if was_edit:
+        bpy.ops.object.mode_set(mode='EDIT')
+
     report = []
+    if unhidden:
+        report.append(('INFO', "Unhid hidden geometry before moving UVs on: %s" % ", ".join(unhidden)))
     if moved:
         report.append(('INFO', "Moved UVs onto the correct tile for %d object(s): %s" % (len(moved), ", ".join(moved))))
     if skipped:
